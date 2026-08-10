@@ -1,6 +1,3 @@
-# Implementation Notes: Role-Based Approval Workflow
-
-This document covers four changes made to add a role-based approval workflow on top of the existing PFM data-modifier pages: centralized role checks via hooks, role-gated Approve/Reject/Send-for-Approval buttons, a per-page Notes field, and a refactoring cleanup pass.
 
 Roles are read from `localStorage` and use lowercase-hyphenated strings: `"mission-planner"`, `"mission-reviewer"`, `"mission-approver"`. For local development, `src/App.jsx` seeds this directly:
 
@@ -93,7 +90,6 @@ const isMissionApprover = useIsMissionApprover();
   </>
 )}
 ```
-(inlined as plain `<div>`s with onClick handlers in the actual file, not extracted components — shown here as pseudo-components for readability)
 
 **Visibility by role:**
 
@@ -241,7 +237,7 @@ setPageNote: (pageName, text) =>
   set((s) => ({ pageNotes: { ...s.pageNotes, [pageName]: text } })),
 ```
 
-**Future purpose (why this exists):** when a `mission-reviewer` clicks **Reject** (§2), `DataModifierHeader.jsx` reads back every page's note from `pageNotes` and bundles them into the `notes` array sent to `POST /PostRejected` — one entry per page, empty string for any page the user never visited:
+
 
 ```js
 const NOTES_PAGE_NAMES = [
@@ -257,6 +253,4 @@ const notes = NOTES_PAGE_NAMES.map((pageName) => ({
 
 ---
 
-## 4. Deleted files (code refactoring)
 
-**Not filled in yet.** This project isn't a git repo (no `.git` here), so there's no history to diff against, and nothing in the current file tree tells me what used to exist and was removed. I don't want to guess at this section — reply with the list of files you deleted (and briefly why, if it's not obvious) and I'll fill this in.
