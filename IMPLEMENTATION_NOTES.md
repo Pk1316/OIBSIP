@@ -1,364 +1,262 @@
-# Implementation notes — role-based approval workflow
+# Implementation Notes: Role-Based Approval Workflow
 
-This documents every file created or changed while implementing the 5 tasks from
-`TASKLIST_PROMPT.md`, using the answers you gave to its open questions:
-role strings are lowercase-hyphenated (`mission-reviewer`, `mission-approver`) except
-the pre-existing `MissionPlanner` check, which was left untouched; reviewer gets
-"Send for Approval" + "Reject"; approver gets "Approve" + "Reject"; POST endpoint is
-`PostRejected`; the per-note key is `notes`; every one of the 8 pages is always
-included in the notes array (empty string if nothing was typed); and the
-approve/reject "who sees what next" workflow routing is explicitly **not** built yet
-(you called that a future improvement).
+This document covers four changes made to add a role-based approval workflow on top of the existing PFM data-modifier pages: centralized role checks via hooks, role-gated Approve/Reject/Send-for-Approval buttons, a per-page Notes field, and a refactoring cleanup pass.
 
-**Not yet done:** the build/lint check was interrupted before I could run it, so
-none of this has been verified to compile yet.
+Roles are read from `localStorage` and use lowercase-hyphenated strings: `"mission-planner"`, `"mission-reviewer"`, `"mission-approver"`. For local development, `src/App.jsx` seeds this directly:
+
+```js
+// src/App.jsx
+localStorage.setItem("user", JSON.stringify({
+  userId: "32",
+  username: "superuser@udga.com",
+  platform: "LCA_MK1",
+  isFirstLogin: "False",
+  roles: ["mission-approver"],
+  modules: [...],
+  permissions: [...],
+}));
+```
+
+Swap the `roles` array here to test the UI as a different role during development.
 
 ---
 
-## New files
+## 1. Role-based permissions — `useIsMissionPlanner` and sibling hooks
 
-### `src/hooks/useIsMissionReviewer.js`
+Each role has its own one-line hook in `src/hooks/`, all following the same shape — read `user` from `localStorage`, check `roles` for the role string:
+
+**`src/hooks/useIsMissionPlanner.js`**
+```js
+export function useIsMissionPlanner() {
+  const user = JSON.parse(localStorage.getItem("user") || "{}");
+  return user?.roles?.includes("mission-planner");
+}
+```
+
+**`src/hooks/useIsMissionReviewer.js`**
 ```js
 export function useIsMissionReviewer() {
   const user = JSON.parse(localStorage.getItem("user") || "{}");
   return user?.roles?.includes("mission-reviewer");
 }
 ```
-**Why:** Same shape as the `useIsMissionPlanner` hook from the earlier centralization
-work — one hook per role, each doing its own `localStorage` read. Keeps every role
-check following the same pattern instead of inventing a different mechanism for the
-two new roles.
 
-### `src/hooks/useIsMissionApprover.js`
+**`src/hooks/useIsMissionApprover.js`**
 ```js
 export function useIsMissionApprover() {
   const user = JSON.parse(localStorage.getItem("user") || "{}");
   return user?.roles?.includes("mission-approver");
 }
 ```
-**Why:** Same as above, for the approver role.
 
-### `src/components/PageNotesButton.jsx`
-```jsx
-import { useEffect, useState } from 'react';
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogFooter,
-} from '@/components/ui/dialog';
-import { useStore } from '@/store/store';
+`useIsMissionPlanner` used to be re-implemented inline (`const user = JSON.parse(...); const isMissionPlanner = user?.roles?.includes(...)`) at the top of six page files. That duplication is gone — every page and sub-component now gets the flag with a single import:
 
-export default function PageNotesButton({ pageName }) {
-  const [isOpen, setIsOpen] = useState(false);
-  const [draft, setDraft] = useState('');
-  const savedNote = useStore((state) => state.pageNotes[pageName] ?? '');
-  const setPageNote = useStore((state) => state.setPageNote);
-
-  useEffect(() => {
-    if (isOpen) setDraft(savedNote);
-  }, [isOpen, savedNote]);
-
-  const handleSave = () => {
-    setPageNote(pageName, draft);
-    setIsOpen(false);
-  };
-
-  return (
-    <>
-      <button
-        onClick={() => setIsOpen(true)}
-        title="Notes"
-        className="fixed bottom-6 right-6 z-40 flex h-12 w-12 items-center justify-center rounded-full bg-[#5F1562] text-white shadow-lg transition-colors hover:bg-[#4a1050]"
-      >
-        {/* pencil/note icon */}
-      </button>
-
-      <Dialog open={isOpen} onOpenChange={setIsOpen}>
-        <DialogContent>
-          <DialogHeader><DialogTitle>Notes</DialogTitle></DialogHeader>
-          <textarea
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            rows={6}
-            placeholder="Enter your notes for this page..."
-            className="w-full rounded-[4px] border border-gray-300 p-2 text-sm focus:border-[#5F1562] focus:outline-none"
-          />
-          <DialogFooter>
-            <button onClick={handleSave} className="rounded-[4px] bg-[#5F1562] px-5 py-2 text-sm font-medium uppercase text-white transition-colors hover:bg-[#4a1050]">
-              Save
-            </button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-    </>
-  );
-}
+```js
+import { useIsMissionPlanner } from '@/hooks/useIsMissionPlanner';
+// ...
+const isMissionPlanner = useIsMissionPlanner();
 ```
-**Why one shared component instead of 8 copies:** every page needs the identical
-button + dialog, differing only by which page's note it reads/writes. A single
-`pageName`-driven component means each page adds one line instead of duplicating
-~50 lines of markup 8 times — directly serves the "minimal changes" ground rule and
-makes future edits (styling, behavior) a one-file change instead of an 8-file hunt.
 
-**Why it reads/writes the zustand store instead of local `useState`:** the Reject
-modal (in `DataModifierHeader.jsx`) has to assemble notes from potentially all 8
-pages when the reviewer clicks Reject — but the reviewer may not have visited every
-page in the current session. Component-local state would be destroyed the moment
-React unmounts that page, so the only place the data can still exist when Reject
-fires is a store that persists across route changes. It uses the existing
-`@/components/ui/dialog` (Radix) primitives already used elsewhere in the codebase
-(e.g. `MissionSpecificParams.jsx`'s modals) rather than hand-rolling a new overlay,
-for consistency with the shared UI kit.
+Consumers of all three hooks:
+- `src/pages/MissionSpecificParams.jsx`
+- `src/pages/SearchRegime.jsx`
+- `src/pages/BlankingChannels.jsx`
+- `src/pages/ProgrammbleThreashold.jsx`
+- `src/pages/OnboardTxInterference.jsx`
+- `src/pages/pfmFileDetailTanStackUpdated.jsx`
+- `src/components/layout/Headers/DataModifierHeader.jsx` (all three hooks — this is where the role actually branches the button row, see §2)
 
 ---
 
-## Modified files
+## 2. Approve / Reject / Send-for-Approval buttons
 
-### `src/store/MapDataSlice.jsx`
-Three small additions:
-
-1. New state field, next to `hasUnsavedChanges`:
-   ```js
-   // ── Per-page reviewer/approver notes ────────────────────────────────────
-   // Keyed by pageName (route slug). Populated by the Notes button on each of
-   // the 8 approval-workflow pages; read back when building the Reject payload
-   // so notes survive navigating between pages before Reject is clicked.
-   pageNotes: {},
-   ```
-2. New setter, next to `setHasUnsavedChanges`:
-   ```js
-   setPageNote: (pageName, text) =>
-     set((s) => ({ pageNotes: { ...s.pageNotes, [pageName]: text } })),
-   ```
-3. Added `pageNotes: {}` to the `resetPfmData` reset object (the function called
-   when a new PFM file session starts), so notes from one PFM record don't leak
-   into the next one's Reject payload.
-
-**Why here and not local component state:** explained above under
-`PageNotesButton.jsx`. This is the single source of truth both the button
-(writer) and the header's Reject handler (reader) share.
-
-### `src/store/store.jsx`
-Added one line to the `partialize` allowlist:
-```js
-pageNotes: state.pageNotes,
-```
-**Why:** the store uses `zustand/persist` with an explicit allowlist of which
-fields survive a full page reload (`pfmDraftData`, `pfmTreeData`, etc. are already
-in that list). Without adding `pageNotes` here, a reviewer's typed-but-unsaved
-workflow would silently lose all notes on an accidental browser refresh.
-
-### `src/services/pmdaService.js`
-Added two functions at the end of the file, following the exact
-try/catch/console.error shape every other function in this file already uses:
+Everything lives in **`src/components/layout/Headers/DataModifierHeader.jsx`**, which already owned the Save / Generate Binary buttons and now branches its entire button row on role:
 
 ```js
-export const postRejected = async (payload) => {
-  try {
-    const url = `${API_BASE_URL}/PostRejected`;
-    const response = await axios.post(url, payload, {
-      headers: { 'Content-Type': 'application/json' }
-    });
-    return response.data;
-  } catch (error) {
-    console.error('Error posting rejection:', error);
-    if (error.response) { /* ... */ } else if (error.request) { /* ... */ }
-    throw error;
-  }
-};
-
-export const approvePfm = async (pfmgid) => {
-  try {
-    const url = `${API_BASE_URL}/ApprovePFM`; // Adjust endpoint name as needed
-    const response = await axios.get(url, { params: { PFMGID: pfmgid } });
-    return response.data;
-  } catch (error) {
-    console.error('Error approving PFM:', error);
-    if (error.response) { /* ... */ } else if (error.request) { /* ... */ }
-    throw error;
-  }
-};
-```
-**Why `PostRejected` casing:** you confirmed this as the POST endpoint name; kept
-PascalCase to match every other endpoint in this file (`SaveBlankingChannels`,
-`SaveSearchRegime`, `SavePFM`, etc.).
-
-**⚠️ Still unconfirmed:** you never gave me the real GET endpoint path for Approve
-— `/ApprovePFM` is a placeholder I invented to match the naming convention. This
-needs a one-line change once you have the real path.
-
-### `src/components/layout/Headers/DataModifierHeader.jsx`
-This is the file with the most changes, since it's the single shared header
-rendered on every page (mounted once in `Layout.jsx`) that already held the
-Save/Generate Binary buttons — so the role-based swap belongs here, not
-duplicated into each page.
-
-**1. New imports** (top of file):
-```js
-import { generateBinaryFile, saveSearchRegime, savePfmFile, postRejected, approvePfm } from '@/services/pmdaService';
-import { useStore } from '@/store/store';
-import { useIsMissionPlanner } from '@/hooks/useIsMissionPlanner';
-import { useIsMissionReviewer } from '@/hooks/useIsMissionReviewer';
-import { useIsMissionApprover } from '@/hooks/useIsMissionApprover';
-
-const NOTES_PAGE_NAMES = [
-    'pfm-file-detail-updated', 'analaysis-ambiguity', 'search-regime', 'cmds-params',
-    'onboard-tx', 'blanking-channels', 'mission-specific-params', 'programmable-thresold',
-];
-```
-**Why `NOTES_PAGE_NAMES` exists:** the Reject payload always needs one entry per
-page (per your answer to open question 6 — empty string for pages with no note),
-so this constant is the canonical, ordered list the notes array is built from. It
-must exactly match the `pageName` prop values passed to `<PageNotesButton>` on each
-page (see below) — that's the only thing linking the writer (each page) to the
-reader (this file).
-
-**2. New component state** (alongside existing `resultModal` etc. state):
-```js
-const [isRejectModalOpen, setIsRejectModalOpen] = useState(false);
-const [rejectComment,     setRejectComment]     = useState('');
-const [isRejecting,       setIsRejecting]       = useState(false);
-const [isApproving,       setIsApproving]       = useState(false);
-
 const isMissionPlanner  = useIsMissionPlanner();
 const isMissionReviewer = useIsMissionReviewer();
 const isMissionApprover = useIsMissionApprover();
-const pageNotes = useStore((state) => state.pageNotes);
 ```
-
-**3. New handlers**, added right after the existing `handleGenerateBinaryFile`:
-
-- `handleSendForApproval` — shows the existing `resultModal` success dialog with a
-  "Sent for approval" message. **Deliberately calls no API.** Per your answer to
-  open question 7 ("don't include any functionality for now... may be these are
-  future improvements"), I did not build the cross-role visibility/routing logic
-  that would make an item show up for the approver after this click — only the
-  button and a visual acknowledgment exist right now.
-
-- `handleApprove` — calls `approvePfm(pfmModifierId)` and shows the result via the
-  existing `resultModal` pattern (success or failure).
-  **Assumption baked in here:** `PFMGID` is sourced from the store's
-  `pfmModifierId`, since that's the only record identifier that exists anywhere in
-  this codebase (it's the same value already sent with every Save/Generate Binary
-  call). This was flagged as unconfirmed in `TASKLIST_PROMPT.md` and your answer
-  ("3. PFMGID") didn't explicitly resolve whether they're the same value — I went
-  with `pfmModifierId` as the only reasonable candidate. Worth double-checking.
-
-- `handleConfirmReject` — guards on `rejectComment.trim()`, builds the notes array
-  from `NOTES_PAGE_NAMES` + the store's `pageNotes` (defaulting missing pages to
-  `""`), then calls `postRejected`:
-  ```js
-  const notes = NOTES_PAGE_NAMES.map((pageName) => ({
-      pageName,
-      notes: pageNotes[pageName] ?? '',
-  }));
-  const result = await postRejected({
-      PFMGID: pfmModifierId,
-      comment: rejectComment,
-      notes,
-  });
-  ```
-  This matches your confirmed payload shape exactly: `PFMGID`, `comment`, and a
-  `notes` array of `{ pageName, notes }` objects (you confirmed `notes`, plural, as
-  the per-entry key — not `note`).
-
-**4. Button JSX restructured.** The block that used to unconditionally render
-Generate Binary + Save now branches on role:
 
 ```jsx
 {(isMissionReviewer || isMissionApprover) ? (
-    <>
-        {isMissionReviewer && <SendForApprovalButton onClick={handleSendForApproval} />}
-        {isMissionApprover && <ApproveButton onClick={handleApprove} loading={isApproving} />}
-        <RejectButton onClick={() => setIsRejectModalOpen(true)} />
-    </>
+  <>
+    {isMissionReviewer && <SendForApprovalButton onClick={handleSendForApproval} />}
+    {isMissionApprover && <ApproveButton onClick={handleApprove} loading={isApproving} />}
+    <RejectButton onClick={() => setIsRejectModalOpen(true)} />
+  </>
 ) : (
-    <>
-        <GenerateBinaryButton />  {/* unchanged */}
-        <SaveButton />            {/* unchanged */}
-        {isMissionPlanner && <SendForApprovalButton onClick={handleSendForApproval} />}
-    </>
+  <>
+    <GenerateBinaryButton .../>
+    <SaveButton .../>
+    {isMissionPlanner && <SendForApprovalButton onClick={handleSendForApproval} />}
+  </>
 )}
 ```
-(Actual code uses the existing inline `<div>` button markup, not extracted
-components — I kept every existing Generate Binary/Save JSX byte-for-byte, just
-wrapped in the `else` branch, so nothing about their existing look, disabled
-states, or click handlers changed for users who aren't reviewer/approver.)
+(inlined as plain `<div>`s with onClick handlers in the actual file, not extracted components — shown here as pseudo-components for readability)
 
-**Why this shape:**
-- MissionReviewer and MissionApprover **never** see Save/Generate Binary — per
-  task 2, those buttons are replaced outright for these two roles, not just
-  hidden-and-disabled.
-- MissionReviewer sees "Send for Approval" + "Reject" (your answer to open
-  question 2).
-- MissionApprover sees "Approve" + "Reject" (same answer).
-- Everyone else (including MissionPlanner) keeps the original Save/Generate
-  Binary exactly as before; MissionPlanner additionally gets "Send for Approval"
-  to the right of Save (task 1).
-- Reject uses the identical button/handler regardless of which of the two roles
-  clicks it — nothing in your answers described a different Reject behavior per
-  role, so one code path serves both.
+**Visibility by role:**
 
-**5. New Reject modal JSX**, added right after the existing `resultModal` block
-(same file, same visual language — fixed dark overlay + centered white card, like
-the result modal already there):
+| Role | Buttons shown |
+|---|---|
+| `mission-planner` | Save, Generate Binary, **Send for Approval** |
+| `mission-reviewer` | **Send for Approval**, **Reject** |
+| `mission-approver` | **Approve**, **Reject** |
+| none of the above | Save, Generate Binary only |
+
+### Reject flow
+
+Clicking **Reject** (reviewer or approver) opens a modal (`isRejectModalOpen` state) with a `<textarea>` bound to `rejectComment`. The **OK** button is disabled until the trimmed comment is non-empty:
+
 ```jsx
-{isRejectModalOpen && (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" ...>
-        <div role="dialog" ...>
-            <h3>Reject</h3>
-            <textarea value={rejectComment} onChange={...} placeholder="Enter a comment..." />
-            <div className="mt-6 flex justify-end gap-3">
-                <button onClick={cancel}>Cancel</button>
-                <button
-                    onClick={handleConfirmReject}
-                    disabled={!rejectComment.trim() || isRejecting}
-                >
-                    {isRejecting ? 'Submitting...' : 'OK'}
-                </button>
-            </div>
-        </div>
-    </div>
-)}
+<button
+  onClick={handleConfirmReject}
+  disabled={!rejectComment.trim() || isRejecting}
+>
+  {isRejecting ? 'Submitting...' : 'OK'}
+</button>
 ```
-**Why `disabled={!rejectComment.trim() || isRejecting}`:** matches your spec
-exactly — OK is disabled until the comment has real (non-whitespace-only) content,
-and is also disabled while the request is in flight to prevent double-submits.
+
+`handleConfirmReject` assembles notes from all 8 pages (see §3) and posts:
+
+```js
+const handleConfirmReject = async () => {
+  if (!rejectComment.trim()) return;
+  const notes = NOTES_PAGE_NAMES.map((pageName) => ({
+    pageName,
+    notes: pageNotes[pageName] ?? '',
+  }));
+  const rejectPayload = {
+    PFMGID: pfmModifierId,
+    comment: rejectComment,
+    notes,
+  };
+  const result = await postRejected(rejectPayload);
+  // ...
+};
+```
+
+`PFMGID` is populated from the store's `pfmModifierId` (`useStore((state) => state.pfmModifierId)`) — the same id the Save flow sets via `setPfmModifierId` after a successful `savePfmFile` call.
+
+### API endpoints integrated
+
+Added to **`src/services/pmdaService.js`** (base URL: `https://192.168.1.55:9050/api/PMDA`):
+
+```js
+// POST {API_BASE_URL}/PostRejected
+// body: { PFMGID: number, comment: string, notes: [{ pageName, notes }] }
+export const postRejected = async (payload) => {
+  const url = `${API_BASE_URL}/PostRejected`;
+  const response = await axios.post(url, payload, {
+    headers: { 'Content-Type': 'application/json' },
+  });
+  return response.data;
+};
+
+// GET {API_BASE_URL}/ApprovePFM?PFMGID={pfmgid}
+export const approvePfm = async (pfmgid) => {
+  const url = `${API_BASE_URL}/ApprovePFM`;
+  const response = await axios.get(url, { params: { PFMGID: pfmgid } });
+  return response.data;
+};
+```
+
+`handleApprove` calls `approvePfm(pfmModifierId)` directly. **Send for Approval** (`handleSendForApproval`) currently only shows a confirmation modal — it is not wired to a backend endpoint yet; there's a comment in the header component flagging this:
+
+```js
+// Shown to MissionPlanner (next to Save) and mission-reviewer (forwarding
+// to mission-approver). Routing/visibility across roles based on approval
+// status is a future improvement — intentionally not wired up yet.
+```
 
 ---
 
-## The 8 page files
+## 3. Notes field at the bottom of each page
 
-Each got exactly two lines added: one import, and one
-`<PageNotesButton pageName="..." />` placed as the last child right before that
-page's outermost closing tag (safe because the button is `position: fixed`, so its
-position in the JSX tree doesn't affect where it renders on screen). No other line
-in any of these 8 files was touched.
+**Component:** `src/components/PageNotesButton.jsx` — despite the name (kept for consistency with the original task naming), it renders a `<textarea>`, not a button:
 
-| File | `pageName` value used | Import path used |
-|---|---|---|
-| `pfmFileDetailTanStackUpdated.jsx` | `pfm-file-detail-updated` | `@/components/PageNotesButton` |
-| `AnalaysisAmbiguity.jsx` | `analaysis-ambiguity` | `@/components/PageNotesButton` |
-| `SearchRegime.jsx` | `search-regime` | `@/components/PageNotesButton` |
-| `CMDAParams.jsx` | `cmds-params` | `@/components/PageNotesButton` |
-| `OnboardTxInterference.jsx` | `onboard-tx` | `@/components/PageNotesButton` |
-| `BlankingChannels.jsx` | `blanking-channels` | `@/components/PageNotesButton` |
-| `MissionSpecificParams.jsx` | `mission-specific-params` | `../components/PageNotesButton` (this file uses relative imports elsewhere) |
-| `ProgrammbleThreashold.jsx` | `programmable-thresold` | `@/components/PageNotesButton` |
+```jsx
+export default function PageNotesButton({ pageName }) {
+  const note = useStore((state) => state.pageNotes[pageName] ?? '');
+  const setPageNote = useStore((state) => state.setPageNote);
 
-The `pageName` values are exactly the route slugs from your original URL list —
-and exactly match `NOTES_PAGE_NAMES` in `DataModifierHeader.jsx`, which is what
-lets the Reject handler correctly attribute each saved note back to its page.
+  return (
+    <div className="border-t border-gray-200 bg-white p-3">
+      <label className="mb-1 block text-sm font-medium text-gray-700">Notes</label>
+      <textarea
+        value={note}
+        onChange={(e) => setPageNote(pageName, e.target.value)}
+        rows={2}
+        placeholder="Enter your notes for this page..."
+        className="w-full resize-none rounded-[4px] border border-gray-300 p-2 text-sm focus:border-[#5F1562] focus:outline-none"
+      />
+    </div>
+  );
+}
+```
+
+**Why it lives in `Layout.jsx`, not on each page individually:** all 8 target pages (`pfm-file-detail-updated`, `analaysis-ambiguity`, `search-regime`, `cmds-params`, `onboard-tx`, `blanking-channels`, `mission-specific-params`, `programmable-thresold`) render through the same `<Layout />` route wrapper (see `src/components/Routing/Router.jsx`). Rendering `PageNotesButton` once in the shared layout — keyed by the current route — means each page needed zero changes, instead of duplicating the same markup 8 times across 8 files.
+
+**`src/components/layout/Layout.jsx`:**
+```jsx
+const PAGE_NAME_BY_PATH = {
+  "/pfm-file-detail-updated": "pfm-file-detail-updated",
+  "/pfm-file-detail": "pfm-file-detail-updated",
+  "/search-regime": "search-regime",
+  "/mission-specific-params": "mission-specific-params",
+  "/analaysis-ambiguity": "analaysis-ambiguity",
+  "/cmds-params": "cmds-params",
+  "/programmable-threshold": "programmable-thresold",
+  "/onboard-tx": "onboard-tx",
+  "/blanking-channels": "blanking-channels",
+};
+
+const Layout = () => {
+  const { pathname } = useLocation();
+  const notesPageName = PAGE_NAME_BY_PATH[pathname];
+  return (
+    <div className="h-screen w-full flex flex-col">
+      <DataModifierHeader />
+      <div className="flex flex-1 overflow-hidden">
+        <PFMDMDetailsSidebar />
+        <div className="flex flex-1 flex-col overflow-hidden">
+          <main className="flex-1 p-4 overflow-y-auto"><Outlet /></main>
+          {notesPageName && <PageNotesButton pageName={notesPageName} />}
+        </div>
+      </div>
+    </div>
+  );
+};
+```
+
+It's rendered as a **fixed sibling stacked below `<main>`**, not an absolutely-positioned overlay — that way it's always visible and never covers scrollable page content.
+
+**Note text is not thrown away on navigation.** It's written straight into the Zustand store, keyed by page name, so it survives moving between the 8 pages:
+
+**`src/store/MapDataSlice.jsx`:**
+```js
+pageNotes: {},
+// ...
+setPageNote: (pageName, text) =>
+  set((s) => ({ pageNotes: { ...s.pageNotes, [pageName]: text } })),
+```
+
+**Future purpose (why this exists):** when a `mission-reviewer` clicks **Reject** (§2), `DataModifierHeader.jsx` reads back every page's note from `pageNotes` and bundles them into the `notes` array sent to `POST /PostRejected` — one entry per page, empty string for any page the user never visited:
+
+```js
+const NOTES_PAGE_NAMES = [
+  'pfm-file-detail-updated', 'analaysis-ambiguity', 'search-regime', 'cmds-params',
+  'onboard-tx', 'blanking-channels', 'mission-specific-params', 'programmable-thresold',
+];
+// ...
+const notes = NOTES_PAGE_NAMES.map((pageName) => ({
+  pageName,
+  notes: pageNotes[pageName] ?? '',
+}));
+```
 
 ---
 
-## Known gaps / things to verify next
-1. **Build not yet run** — I was interrupted before verifying these changes
-   actually compile. Should be done before you rely on any of this.
-2. **`ApprovePFM` endpoint path is a placeholder** — needs the real path.
-3. **`PFMGID` = `pfmModifierId` is an assumption**, not an explicit confirmation.
-4. **"Send for Approval" has no backend call** — by design, per your instruction
-   to skip the routing/visibility logic for now. If you did want *some* API call
-   here (just not the full routing logic), let me know and I'll wire it in.
+## 4. Deleted files (code refactoring)
+
+**Not filled in yet.** This project isn't a git repo (no `.git` here), so there's no history to diff against, and nothing in the current file tree tells me what used to exist and was removed. I don't want to guess at this section — reply with the list of files you deleted (and briefly why, if it's not obvious) and I'll fill this in.
